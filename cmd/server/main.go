@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"os"
 	"os/signal"
 	"quic-transproxy/internal/server"
@@ -12,11 +11,11 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "", "Path to server configuration file")
+	/*configPath := flag.String("config", "", "Path to server configuration file")
 	flag.Parse()
-
+	*/
 	// TODO: Parse config file
-	cfg, err := config.LoadServerConfig(*configPath)
+	cfg, err := config.LoadServerConfig()
 	if err != nil {
 		panic(err)
 	}

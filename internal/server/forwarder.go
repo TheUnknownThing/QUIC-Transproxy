@@ -74,8 +74,7 @@ func (f *QUICForwarder) getOrCreateConnection(ctx context.Context, targetSNI str
 	}
 
 	tlsConfig := &tls.Config{
-		ServerName:         targetSNI,
-		InsecureSkipVerify: true, // Test only
+		ServerName: targetSNI,
 	}
 
 	addr := fmt.Sprintf("%s:443", targetSNI)

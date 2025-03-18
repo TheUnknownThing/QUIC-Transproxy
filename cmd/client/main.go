@@ -2,21 +2,20 @@ package main
 
 import (
 	"context"
-	"flag"
 	"os"
 	"os/signal"
 	"quic-transproxy/internal/client"
 	"quic-transproxy/internal/shared/config"
 	"quic-transproxy/internal/shared/logger"
 	"syscall"
+	"time"
 )
 
 func main() {
-	configPath := flag.String("config", "", "Path to client configuration file")
-	flag.Parse()
+	/*configPath := flag.String("config", "", "Path to client configuration file")
+	flag.Parse()*/
 
-	// TODO: Parse config file
-	cfg, err := config.LoadClientConfig(*configPath)
+	cfg, err := config.LoadClientConfig()
 	if err != nil {
 		panic(err)
 	}
@@ -40,13 +39,36 @@ func main() {
 	}()
 
 	go func() {
-		if err := listener.Start(ctx); err != nil && err != context.Canceled {
-			log.Error("Listener error: %v", err)
-			cancel()
+		for {
+			if err := listener.Start(ctx); err != nil {
+				if err == context.Canceled {
+					return
+				}
+
+				log.Error("Listener error: %v, restarting in 5s...", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+					// Continue to try to restart the listener
+				}
+			}
 		}
 	}()
 
-	if err := quicClient.Start(ctx); err != nil && err != context.Canceled {
-		log.Error("QUIC client error: %v", err)
+	for {
+		if err := quicClient.Start(ctx); err != nil {
+			if err == context.Canceled {
+				break
+			}
+
+			log.Error("QUIC client error: %v, restarting in 5s...", err)
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
 	}
 }
