@@ -1,45 +1,43 @@
 package server
 
 import (
-	"quic-transproxy/internal/logger"
+	"encoding/hex"
 	"sync"
 )
 
 type SNIMapper struct {
-	logger   *logger.Logger
-	mappings map[uint16]string
-	mutex    sync.RWMutex
+	mutex   sync.RWMutex
+	mapping map[string]string
 }
 
-func NewSNIMapper(logger *logger.Logger) *SNIMapper {
+func NewSNIMapper() *SNIMapper {
 	return &SNIMapper{
-		logger:   logger,
-		mappings: make(map[uint16]string),
+		mapping: make(map[string]string),
 	}
 }
 
-func (m *SNIMapper) AddMapping(sniIdentifier uint16, sni string) {
+func (m *SNIMapper) Update(identifier []byte, sni string) {
+	if len(identifier) == 0 || sni == "" {
+		return
+	}
+
+	key := hex.EncodeToString(identifier)
+
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	m.mappings[sniIdentifier] = sni
-	m.logger.Debug("Added mapping: SNI identifier %d -> %s", sniIdentifier, sni)
+	m.mapping[key] = sni
 }
 
-func (m *SNIMapper) GetSNI(sniIdentifier uint16) (string, bool) {
+func (m *SNIMapper) Lookup(identifier []byte) string {
+	if len(identifier) == 0 {
+		return ""
+	}
+
+	key := hex.EncodeToString(identifier)
+
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	sni, exists := m.mappings[sniIdentifier]
-	return sni, exists
-}
-
-func (m *SNIMapper) DeleteMapping(sniIdentifier uint16) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	if _, exists := m.mappings[sniIdentifier]; exists {
-		delete(m.mappings, sniIdentifier)
-		m.logger.Debug("Deleted mapping for SNI identifier %d", sniIdentifier)
-	}
+	return m.mapping[key]
 }

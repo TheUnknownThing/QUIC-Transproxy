@@ -3,99 +3,158 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
-	"quic-transproxy/internal/logger"
-	"quic-transproxy/internal/quiclib"
+	"quic-transproxy/internal/shared/logger"
+	"quic-transproxy/internal/shared/quic_lib"
+	"sync"
 )
 
 type QUICClient struct {
-	proxyAddr       string
-	logger          *logger.Logger
-	quicClient      quiclib.QUICClient
-	quicConn        *quiclib.QUICConn
-	listener        *Listener
-	sniGenerator    *SNIIdentifierGenerator
-	connectionIDMod *ConnectionIDModifier
-	ctx             context.Context
-	cancel          context.CancelFunc
+	proxyAddr     string
+	proxyPort     int
+	log           logger.Logger
+	listener      *Listener
+	sniGen        *SNIIdentifierGenerator
+	packetMod     *PacketModifier
+	conn          *quic_lib.QUICConnection
+	responseConns map[string]*net.UDPConn
+	mutex         sync.RWMutex
 }
 
-func NewQUICClient(
-	proxyAddr string,
-	logger *logger.Logger,
-	listener *Listener,
-	sniGenerator *SNIIdentifierGenerator,
-	connectionIDMod *ConnectionIDModifier,
-) *QUICClient {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewQUICClient(proxyAddr string, proxyPort int, listener *Listener, log logger.Logger) *QUICClient {
 	return &QUICClient{
-		proxyAddr:       proxyAddr,
-		logger:          logger,
-		quicClient:      quiclib.NewQUICClient(),
-		listener:        listener,
-		sniGenerator:    sniGenerator,
-		connectionIDMod: connectionIDMod,
-		ctx:             ctx,
-		cancel:          cancel,
+		proxyAddr:     proxyAddr,
+		proxyPort:     proxyPort,
+		log:           log,
+		listener:      listener,
+		sniGen:        NewSNIIdentifierGenerator(),
+		packetMod:     NewPacketModifier(),
+		responseConns: make(map[string]*net.UDPConn),
 	}
 }
 
-// Connect to the proxy server
-func (c *QUICClient) Connect() error {
+func (c *QUICClient) getOrCreateUDPConn(addrStr string) (*net.UDPConn, error) {
+	c.mutex.RLock()
+	conn, exists := c.responseConns[addrStr]
+	c.mutex.RUnlock()
+
+	if exists {
+		return conn, nil
+	}
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	conn, exists = c.responseConns[addrStr]
+	if exists {
+		return conn, nil
+	}
+
+	udpConn, err := net.Dial("udp", addrStr)
+	if err != nil {
+		return nil, err
+	}
+
+	udpConn2, ok := udpConn.(*net.UDPConn)
+	if !ok {
+		udpConn.Close()
+		return nil, fmt.Errorf("failed to convert to UDPConn")
+	}
+
+	c.responseConns[addrStr] = udpConn2
+	return udpConn2, nil
+}
+
+func (c *QUICClient) Start(ctx context.Context) error {
+	proxyAddrStr := fmt.Sprintf("%s:%d", c.proxyAddr, c.proxyPort)
+
 	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true, // FOR TEST ONLY
+		InsecureSkipVerify: true, // For debugging purposes
+		NextProtos:         []string{"quic-transproxy"},
 	}
 
 	var err error
-	c.quicConn, err = c.quicClient.Connect(c.ctx, c.proxyAddr, tlsConfig)
+	// TODO: 0-RTT Handshake (DialEarly)
+	c.conn, err = quic_lib.Dial(ctx, proxyAddrStr, tlsConfig)
 	if err != nil {
-		c.logger.Error("Failed to connect to proxy server: %v", err)
-		return err
+		return fmt.Errorf("failed to connect to proxy server: %w", err)
 	}
+	defer c.conn.Close()
 
-	c.logger.Info("Connected to proxy server at %s", c.proxyAddr)
+	c.log.Info("Connected to proxy server at %s", proxyAddrStr)
 
-	return nil
-}
+	packetCh := c.listener.GetPacketChannel()
+	addrCh := c.listener.GetAddrChannel()
 
-func (c *QUICClient) Start() {
-	go c.processPackets()
-}
-
-func (c *QUICClient) processPackets() {
 	for {
 		select {
-		case <-c.ctx.Done():
-			return
-		case packet := <-c.listener.GetPacketChan():
-			c.handlePacket(packet)
+		case <-ctx.Done():
+			return ctx.Err()
+		case data := <-packetCh:
+			srcAddr, ok := <-addrCh
+			if !ok {
+				c.log.Error("Address channel closed")
+				return fmt.Errorf("address channel closed")
+			}
+
+			sniIdentifier := c.sniGen.GenerateFromAddr(srcAddr)
+
+			modifiedPacket := c.packetMod.ModifyPacket(data, sniIdentifier)
+
+			stream, err := c.conn.OpenStream()
+			if err != nil {
+				c.log.Error("Failed to open stream: %v", err)
+				continue
+			}
+
+			_, err = stream.Write(modifiedPacket.Data)
+			if err != nil {
+				c.log.Error("Failed to send data: %v", err)
+				stream.Close()
+				continue
+			}
+
+			go c.handleResponse(ctx, stream, srcAddr)
 		}
 	}
 }
 
-func (c *QUICClient) handlePacket(packet []byte) {
-	// SIMPLIFY: NEED TO PARSE THE ACTUAL PACKET TO GET THE IP AND PORT
-	sniIdentifier := c.sniGenerator.GenerateIdentifier(net.ParseIP("127.0.0.1"), 12345)
+// handleResponse 处理服务器响应
+func (c *QUICClient) handleResponse(ctx context.Context, stream *quic_lib.QUICStream, srcAddr net.Addr) {
+	defer stream.Close()
 
-	modifiedPacket, err := c.connectionIDMod.ModifyPacket(packet, sniIdentifier)
-	if err != nil {
-		c.logger.Error("Failed to modify packet: %v", err)
-		return
+	buffer := make([]byte, 65535)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			n, err := stream.Read(buffer)
+			if err != nil {
+				c.log.Error("Error reading response: %v", err)
+				return
+			}
+
+			c.log.Debug("Received %d bytes from proxy server", n)
+
+			udpAddr, ok := srcAddr.(*net.UDPAddr)
+			if !ok {
+				c.log.Error("Invalid source address type")
+				continue
+			}
+
+			addrStr := udpAddr.String()
+			udpConn, err := c.getOrCreateUDPConn(addrStr)
+			if err != nil {
+				c.log.Error("Failed to get UDP conn: %v", err)
+				continue
+			}
+
+			_, err = udpConn.Write(buffer[:n])
+			if err != nil {
+				c.log.Error("Failed to send response: %v", err)
+			}
+		}
 	}
-
-	_, err = c.quicConn.Stream.Write(modifiedPacket)
-	if err != nil {
-		c.logger.Error("Failed to write packet to proxy server: %v", err)
-		return
-	}
-
-	c.logger.Debug("Forwarded packet with SNI identifier %d to proxy server", sniIdentifier)
-}
-
-func (c *QUICClient) Close() error {
-	c.cancel()
-	if c.quicClient != nil {
-		return c.quicClient.Close()
-	}
-	return nil
 }

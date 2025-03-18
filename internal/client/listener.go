@@ -2,84 +2,76 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net"
-	"quic-transproxy/internal/logger"
+	"quic-transproxy/internal/shared/logger"
 )
 
 type Listener struct {
 	listenAddr string
-	logger     *logger.Logger
-	packetChan chan []byte
-	udpConn    *net.UDPConn
-	ctx        context.Context
-	cancel     context.CancelFunc
+	listenPort int
+	log        logger.Logger
+	packetCh   chan []byte
+	addrCh     chan net.Addr
 }
 
-func NewListener(listenAddr string, logger *logger.Logger) *Listener {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewListener(addr string, port int, log logger.Logger) *Listener {
 	return &Listener{
-		listenAddr: listenAddr,
-		logger:     logger,
-		packetChan: make(chan []byte, 100),
-		ctx:        ctx,
-		cancel:     cancel,
+		listenAddr: addr,
+		listenPort: port,
+		log:        log,
+		packetCh:   make(chan []byte, 100),
+		addrCh:     make(chan net.Addr, 100),
 	}
 }
 
-func (l *Listener) Start() error {
-	addr, err := net.ResolveUDPAddr("udp", l.listenAddr)
+func (l *Listener) Start(ctx context.Context) error {
+	addr := fmt.Sprintf("%s:%d", l.listenAddr, l.listenPort)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return err
 	}
 
-	l.udpConn, err = net.ListenUDP("udp", addr)
+	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 
-	l.logger.Info("Listening on %s", l.listenAddr)
+	l.log.Info("Listener started on %s", addr)
 
-	go l.receivePackets()
-
-	return nil
-}
-
-func (l *Listener) receivePackets() {
-	buffer := make([]byte, 2048)
+	buffer := make([]byte, 65535)
 
 	for {
 		select {
-		case <-l.ctx.Done():
-			return
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
-			n, _, err := l.udpConn.ReadFromUDP(buffer)
+			n, srcAddr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
-				l.logger.Error("Failed to read UDP packet: %v", err)
+				l.log.Error("Error reading UDP: %v", err)
 				continue
 			}
 
-			packet := make([]byte, n)
-			copy(packet, buffer[:n])
+			data := make([]byte, n)
+			copy(data, buffer[:n])
+
+			l.log.Debug("Received %d bytes from %s", n, srcAddr.String())
 
 			select {
-			case l.packetChan <- packet:
-				l.logger.Debug("Received packet of length %d", n)
+			case l.packetCh <- data:
+				l.addrCh <- srcAddr
 			default:
-				l.logger.Warn("Packet channel full, dropping packet")
+				l.log.Warn("Channel full, dropping packet")
 			}
 		}
 	}
 }
 
-// GetPacketChan returns the channel that receives packets
-func (l *Listener) GetPacketChan() <-chan []byte {
-	return l.packetChan
+func (l *Listener) GetPacketChannel() <-chan []byte {
+	return l.packetCh
 }
 
-func (l *Listener) Close() error {
-	l.cancel()
-	if l.udpConn != nil {
-		return l.udpConn.Close()
-	}
-	return nil
+func (l *Listener) GetAddrChannel() <-chan net.Addr {
+	return l.addrCh
 }

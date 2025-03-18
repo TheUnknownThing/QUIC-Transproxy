@@ -3,95 +3,62 @@ package server
 import (
 	"context"
 	"crypto/tls"
-	"net"
-	"quic-transproxy/internal/logger"
-	"quic-transproxy/internal/quiclib"
+	"fmt"
+	"quic-transproxy/internal/shared/logger"
+	"quic-transproxy/internal/shared/quic_lib"
 	"sync"
+	"time"
 )
 
 type QUICForwarder struct {
-	logger               *logger.Logger
-	sniMapper            *SNIMapper
-	sniExtractor         *SNIIdentifierExtractor
-	connectionIDRestorer *ConnectionIDRestorer
-	connections          map[uint16]*quiclib.QUICConn
-	mutex                sync.RWMutex
-	ctx                  context.Context
-	cancel               context.CancelFunc
+	log         logger.Logger
+	mutex       sync.RWMutex
+	connections map[string]*quic_lib.QUICConnection
+	timeout     time.Duration
 }
 
-func NewQUICForwarder(
-	logger *logger.Logger,
-	sniMapper *SNIMapper,
-	sniExtractor *SNIIdentifierExtractor,
-	connectionIDRestorer *ConnectionIDRestorer,
-) *QUICForwarder {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewQUICForwarder(log logger.Logger) *QUICForwarder {
 	return &QUICForwarder{
-		logger:               logger,
-		sniMapper:            sniMapper,
-		sniExtractor:         sniExtractor,
-		connectionIDRestorer: connectionIDRestorer,
-		connections:          make(map[uint16]*quiclib.QUICConn),
-		ctx:                  ctx,
-		cancel:               cancel,
+		log:         log,
+		connections: make(map[string]*quic_lib.QUICConnection),
+		timeout:     5 * time.Second,
 	}
 }
 
-func (f *QUICForwarder) HandleConnection(conn *quiclib.QUICConn) {
-	go f.processStreams(conn)
-}
+func (f *QUICForwarder) Forward(ctx context.Context, targetSNI string, data []byte) ([]byte, error) {
+	forwardCtx, cancel := context.WithTimeout(ctx, f.timeout)
+	defer cancel()
 
-func (f *QUICForwarder) processStreams(conn *quiclib.QUICConn) {
-	buffer := make([]byte, 2048)
-
-	for {
-		n, err := conn.Stream.Read(buffer)
-		if err != nil {
-			f.logger.Error("Failed to read from QUIC stream: %v", err)
-			return
-		}
-
-		packet := buffer[:n]
-
-		sniIdentifier, err := f.sniExtractor.ExtractSNIIdentifier(packet)
-		if err != nil {
-			f.logger.Error("Failed to extract SNI identifier: %v", err)
-			continue
-		}
-
-		sni, exists := f.sniMapper.GetSNI(sniIdentifier)
-		if !exists {
-			sni = "theunknown.site"
-			f.sniMapper.AddMapping(sniIdentifier, sni)
-		}
-
-		restoredPacket, err := f.connectionIDRestorer.RestorePacket(packet)
-		if err != nil {
-			f.logger.Error("Failed to restore packet: %v", err)
-			continue
-		}
-
-		targetConn, err := f.getOrCreateConnection(sniIdentifier, sni)
-		if err != nil {
-			f.logger.Error("Failed to get or create connection to target server: %v", err)
-			continue
-		}
-
-		_, err = targetConn.Stream.Write(restoredPacket)
-		if err != nil {
-			f.logger.Error("Failed to write packet to target server: %v", err)
-			continue
-		}
-
-		f.logger.Debug("Forwarded packet to target server %s for SNI identifier %d", sni, sniIdentifier)
+	conn, err := f.getOrCreateConnection(forwardCtx, targetSNI)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection to %s: %w", targetSNI, err)
 	}
+
+	stream, err := conn.OpenStream()
+	if err != nil {
+		f.removeConnection(targetSNI)
+		return nil, fmt.Errorf("failed to open stream: %w", err)
+	}
+	defer stream.Close()
+
+	_, err = stream.Write(data)
+	if err != nil {
+		f.removeConnection(targetSNI)
+		return nil, fmt.Errorf("failed to send data: %w", err)
+	}
+
+	buffer := make([]byte, 65535)
+	n, err := stream.Read(buffer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	return buffer[:n], nil
 }
 
-// getOrCreateConnection gets an existing connection or creates a new one
-func (f *QUICForwarder) getOrCreateConnection(sniIdentifier uint16, sni string) (*quiclib.QUICConn, error) {
+func (f *QUICForwarder) getOrCreateConnection(ctx context.Context, targetSNI string) (*quic_lib.QUICConnection, error) {
 	f.mutex.RLock()
-	conn, exists := f.connections[sniIdentifier]
+	conn, exists := f.connections[targetSNI]
 	f.mutex.RUnlock()
 
 	if exists {
@@ -101,36 +68,35 @@ func (f *QUICForwarder) getOrCreateConnection(sniIdentifier uint16, sni string) 
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
-	if conn, exists = f.connections[sniIdentifier]; exists {
+	conn, exists = f.connections[targetSNI]
+	if exists {
 		return conn, nil
 	}
 
 	tlsConfig := &tls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: true, // FOR TEST ONLY
+		ServerName:         targetSNI,
+		InsecureSkipVerify: true, // Test only
 	}
 
-	targetAddr := net.JoinHostPort(sni, "443")
-
-	quicClient := quiclib.NewQUICClient()
-	conn, err := quicClient.Connect(f.ctx, targetAddr, tlsConfig)
+	addr := fmt.Sprintf("%s:443", targetSNI)
+	conn, err := quic_lib.Dial(ctx, addr, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	f.connections[sniIdentifier] = conn
-	f.logger.Info("Created new connection to target server %s for SNI identifier %d", sni, sniIdentifier)
+	f.connections[targetSNI] = conn
+	f.log.Info("Created new connection to %s", targetSNI)
 
 	return conn, nil
 }
 
-func (f *QUICForwarder) Close() {
-	f.cancel()
-
+func (f *QUICForwarder) removeConnection(targetSNI string) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
-	for _, conn := range f.connections {
-		conn.Session.CloseWithError(0, "forwarder closed")
+	if conn, exists := f.connections[targetSNI]; exists {
+		conn.Close()
+		delete(f.connections, targetSNI)
+		f.log.Info("Removed connection to %s", targetSNI)
 	}
 }

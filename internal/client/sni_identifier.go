@@ -1,57 +1,63 @@
 package client
 
 import (
+	"encoding/binary"
+	"fmt"
 	"hash/fnv"
 	"net"
-	"quic-transproxy/internal/logger"
 )
 
 type SNIIdentifierGenerator struct {
-	logger *logger.Logger
-	cache  map[string]uint16
+	cache map[string][]byte
 }
 
-func NewSNIIdentifierGenerator(logger *logger.Logger) *SNIIdentifierGenerator {
+func NewSNIIdentifierGenerator() *SNIIdentifierGenerator {
 	return &SNIIdentifierGenerator{
-		logger: logger,
-		cache:  make(map[string]uint16),
+		cache: make(map[string][]byte),
 	}
 }
 
-func (g *SNIIdentifierGenerator) GenerateIdentifier(sourceIP net.IP, sourcePort int) uint16 {
-	key := sourceIP.String() + ":" + string(sourcePort)
+func (g *SNIIdentifierGenerator) Generate(srcIP net.IP, srcPort int) []byte {
+	key := fmt.Sprintf("%s:%d", srcIP.String(), srcPort)
 
-	// check if the identifier is already cached
 	if id, exists := g.cache[key]; exists {
-		g.logger.Debug("Using cached SNI identifier %d for %s", id, key)
 		return id
 	}
 
+	// FNV-1a hash
 	h := fnv.New32a()
-	h.Write(sourceIP)
-	h.Write([]byte{byte(sourcePort >> 8), byte(sourcePort)})
+	h.Write(srcIP)
+	binary.Write(h, binary.BigEndian, uint16(srcPort))
 
-	// use the lower 16 bits of the hash value as the identifier
-	identifier := uint16(h.Sum32() & 0xFFFF)
+	hash := h.Sum32()
+	identifier := make([]byte, 2)
+	// Lower 16 bits of the hash
+	binary.BigEndian.PutUint16(identifier, uint16(hash))
 
+	// cache result
 	g.cache[key] = identifier
-
-	g.logger.Debug("Generated new SNI identifier %d for %s", identifier, key)
 
 	return identifier
 }
 
-// GenerateIdentifierFromAddr generates an identifier from a net.Addr
-func (g *SNIIdentifierGenerator) GenerateIdentifierFromAddr(addr net.Addr) uint16 {
-	if udpAddr, ok := addr.(*net.UDPAddr); ok {
-		return g.GenerateIdentifier(udpAddr.IP, udpAddr.Port)
+func (g *SNIIdentifierGenerator) GenerateFromAddr(addr net.Addr) []byte {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		host, port, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return []byte{0xFF, 0xFF} // invalid address
+		}
+
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return []byte{0xFF, 0xFF}
+		}
+
+		var portNum int
+		fmt.Sscanf(port, "%d", &portNum)
+
+		return g.Generate(ip, portNum)
 	}
 
-	h := fnv.New32a()
-	h.Write([]byte(addr.String()))
-
-	identifier := uint16(h.Sum32() & 0xFFFF)
-	g.logger.Debug("Generated new SNI identifier %d for address %s", identifier, addr.String())
-
-	return identifier
+	return g.Generate(udpAddr.IP, udpAddr.Port)
 }

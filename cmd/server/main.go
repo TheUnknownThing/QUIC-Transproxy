@@ -1,61 +1,43 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"os/signal"
-	"quic-transproxy/internal/config"
-	"quic-transproxy/internal/logger"
 	"quic-transproxy/internal/server"
+	"quic-transproxy/internal/shared/config"
+	"quic-transproxy/internal/shared/logger"
 	"syscall"
 )
 
 func main() {
-	configFile := flag.String("config", "", "Path to configuration file")
-	listenAddr := flag.String("listen", "0.0.0.0:8443", "Address to listen on")
-	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	configPath := flag.String("config", "", "Path to server configuration file")
 	flag.Parse()
 
-	log := logger.NewLogger(*logLevel)
-
-	cfg := config.NewDefaultConfig()
-	if *configFile != "" {
-		// TODO: Load configuration from file
-	}
-
-	if *listenAddr != "" {
-		cfg.ServerListenAddr = *listenAddr
-	}
-	if *logLevel != "" {
-		cfg.LogLevel = *logLevel
-	}
-
-	quicListener := server.NewQUICListener(cfg.ServerListenAddr, log)
-	sniExtractor := server.NewSNIIdentifierExtractor(log)
-	sniMapper := server.NewSNIMapper(log)
-	connectionIDRestorer := server.NewConnectionIDRestorer(log)
-	quicForwarder := server.NewQUICForwarder(log, sniMapper, sniExtractor, connectionIDRestorer)
-
-	err := quicListener.Start()
+	// TODO: Parse config file
+	cfg, err := config.LoadServerConfig(*configPath)
 	if err != nil {
-		log.Error("Failed to start QUIC listener: %v", err)
-		os.Exit(1)
+		panic(err)
 	}
 
-	log.Info("Server started, listening on %s", cfg.ServerListenAddr)
+	log := logger.NewSimpleLogger()
+
+	listener := server.NewQUICListener(cfg.ListenAddress, cfg.ListenPort, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		for conn := range quicListener.GetConnectionChan() {
-			quicForwarder.HandleConnection(conn)
-		}
+		<-signalCh
+		log.Info("Shutting down server...")
+		cancel()
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-
-	log.Info("Shutting down...")
-
-	quicForwarder.Close()
-	quicListener.Close()
+	if err := listener.Start(ctx); err != nil && err != context.Canceled {
+		log.Error("QUIC listener error: %v", err)
+	}
 }
