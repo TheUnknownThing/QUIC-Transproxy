@@ -2,189 +2,229 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"fmt"
-	"math/big"
+	"net"
 	"quic-transproxy/internal/shared/logger"
 	"quic-transproxy/internal/shared/packet"
-	"quic-transproxy/internal/shared/quic_lib"
-	"time"
+	"sync"
 )
 
-type QUICListener struct {
-	listenAddr string
-	listenPort int
-	log        logger.Logger
-	listener   *quic_lib.QUICListener
+type TransparentProxyServer struct {
+	clientPort  int
+	websitePort int
+	log         logger.Logger
+	sniSniffer  *SNISniffer
+	sniMapper   *SNIMapper
+
+	clientToWebsite map[string]string // SNI_identifier -> Target_address
+	websiteToClient map[string]string // Address -> Client_address
+	mutex           sync.RWMutex
 }
 
-func NewQUICListener(addr string, port int, log logger.Logger) *QUICListener {
-	return &QUICListener{
-		listenAddr: addr,
-		listenPort: port,
-		log:        log,
+func NewTransparentProxyServer(clientPort, websitePort int, log logger.Logger) *TransparentProxyServer {
+	return &TransparentProxyServer{
+		clientPort:      clientPort,
+		websitePort:     websitePort,
+		log:             log,
+		sniSniffer:      NewSNISniffer(),
+		sniMapper:       NewSNIMapper(),
+		clientToWebsite: make(map[string]string),
+		websiteToClient: make(map[string]string),
 	}
 }
 
-func (l *QUICListener) Start(ctx context.Context) error {
-	addr := fmt.Sprintf("%s:%d", l.listenAddr, l.listenPort)
+func (s *TransparentProxyServer) Start(ctx context.Context) error {
+	errCh := make(chan error, 2)
 
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{generateSelfSignedCert()},
-		NextProtos:   []string{"quic-transproxy"},
+	go func() {
+		err := s.listenForClients(ctx)
+		errCh <- err
+	}()
+
+	go func() {
+		err := s.listenForWebsites(ctx)
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
 
-	var err error
-	l.listener, err = quic_lib.NewQUICListener(addr, tlsConfig)
+func (s *TransparentProxyServer) listenForClients(ctx context.Context) error {
+	addr := fmt.Sprintf("0.0.0.0:%d", s.clientPort)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
-		return fmt.Errorf("failed to create QUIC listener: %w", err)
+		return err
 	}
-	defer l.listener.Close()
 
-	l.log.Info("QUIC listener started on %s", addr)
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
+	s.log.Info("Listening for client traffic on %s", addr)
+
+	buffer := make([]byte, 65535)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			conn, err := l.listener.Accept(ctx)
+			n, clientAddr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
-				l.log.Error("Error accepting connection: %v", err)
+				s.log.Error("Error reading from client: %v", err)
 				continue
 			}
 
-			l.log.Info("Accepted new connection")
+			clientData := make([]byte, n)
+			copy(clientData, buffer[:n])
 
-			handler := NewConnectionHandler(conn, l.log)
+			s.log.Debug("Received %d bytes from client %s", n, clientAddr.String())
 
-			go handler.Handle(ctx)
+			go s.handleClientPacket(ctx, clientData, clientAddr)
 		}
 	}
 }
 
-func generateSelfSignedCert() tls.Certificate {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+func (s *TransparentProxyServer) listenForWebsites(ctx context.Context) error {
+	addr := fmt.Sprintf("0.0.0.0:%d", s.websitePort)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"QUIC Transproxy"},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(time.Hour * 24 * 180),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		panic(err)
+		return err
 	}
+	defer conn.Close()
 
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	s.log.Info("Listening for website responses on %s", addr)
 
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic(err)
-	}
-
-	return tlsCert
-}
-
-type ConnectionHandler struct {
-	conn          *quic_lib.QUICConnection
-	log           logger.Logger
-	sniSniffer    *SNISniffer
-	sniMapper     *SNIMapper
-	quicForwarder *QUICForwarder
-}
-
-func NewConnectionHandler(conn *quic_lib.QUICConnection, log logger.Logger) *ConnectionHandler {
-	return &ConnectionHandler{
-		conn:          conn,
-		log:           log,
-		sniSniffer:    NewSNISniffer(),
-		sniMapper:     NewSNIMapper(),
-		quicForwarder: NewQUICForwarder(log),
-	}
-}
-
-func (h *ConnectionHandler) Handle(ctx context.Context) {
-	defer h.conn.Close()
-
+	buffer := make([]byte, 65535)
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		default:
-			stream, err := h.conn.AcceptStream(ctx)
+			n, websiteAddr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
-				h.log.Error("Error accepting stream: %v", err)
-				return
+				s.log.Error("Error reading from website: %v", err)
+				continue
 			}
 
-			go h.handleStream(ctx, stream)
+			websiteData := make([]byte, n)
+			copy(websiteData, buffer[:n])
+
+			s.log.Debug("Received %d bytes from website %s", n, websiteAddr.String())
+
+			go s.handleWebsitePacket(ctx, websiteData, websiteAddr)
 		}
 	}
 }
 
-func (h *ConnectionHandler) handleStream(ctx context.Context, stream *quic_lib.QUICStream) {
-	defer stream.Close()
-
-	buffer := make([]byte, 65535)
-	n, err := stream.Read(buffer)
-	if err != nil {
-		h.log.Error("Error reading from stream: %v", err)
-		return
-	}
-
-	data := buffer[:n]
-	h.log.Debug("Received %d bytes from client", n)
-
-	p := packet.NewPacket(data)
-	sniIdentifier := p.ExtractSNIIdentifier()
+func (s *TransparentProxyServer) handleClientPacket(ctx context.Context, data []byte, clientAddr *net.UDPAddr) {
+	pkt := packet.NewPacket(data)
+	sniIdentifier := pkt.ExtractSNIIdentifier()
 
 	if len(sniIdentifier) != 2 {
-		h.log.Error("Invalid SNI identifier length: %d", len(sniIdentifier))
+		s.log.Error("Invalid SNI identifier length: %d", len(sniIdentifier))
 		return
 	}
 
-	sni := h.sniSniffer.Sniff(p.Data)
+	// if there exists a mapping for this SNI identifier, forward the packet to the website
+	sni := s.sniMapper.Lookup(sniIdentifier)
+	if sni == "" {
+		// sniff SNI from the packet
+		sni := s.sniSniffer.Sniff(pkt.Data)
 
-	if sni != "" {
-		h.sniMapper.Update(sniIdentifier, sni)
+		if sni == "" {
+			s.log.Warn("Could not sniff SNI from client packet")
+			return
+		}
+
+		s.sniMapper.Update(sniIdentifier, sni)
 	}
 
-	targetSNI := h.sniMapper.Lookup(sniIdentifier)
-	if targetSNI == "" {
-		h.log.Warn("No target SNI found for identifier")
-		return
-	}
+	pkt.RestorePacket()
 
-	p.RestorePacket()
+	targetAddr := fmt.Sprintf("%s:443", sni)
+	raddr, err := net.ResolveUDPAddr("udp", targetAddr)
 
-	response, err := h.quicForwarder.Forward(ctx, targetSNI, p.Data)
+	s.log.Debug("Creating connection to website %s", targetAddr)
+
 	if err != nil {
-		h.log.Error("Error forwarding packet: %v", err)
+		s.log.Error("Failed to resolve target address: %v", err)
 		return
 	}
 
-	_, err = stream.Write(response)
+	s.updateMapping(clientAddr.String(), sniIdentifier, raddr.String())
+
+	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
-		h.log.Error("Error writing response: %v", err)
+		s.log.Error("Failed to create UDP connection: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(pkt.Data)
+	if err != nil {
+		s.log.Error("Failed to forward packet to website: %v", err)
 		return
 	}
 
-	h.log.Debug("Sent %d bytes response to client", len(response))
+	s.log.Debug("Forwarded %d bytes to website %s", len(pkt.Data), targetAddr)
+}
+
+func (s *TransparentProxyServer) handleWebsitePacket(ctx context.Context, data []byte, websiteAddr *net.UDPAddr) {
+	// clientAddrStr := s.getClientAddrByWebsite(websiteAddr.String())
+	clientAddrStr := "127.0.0.1:8000"
+	if clientAddrStr == "" {
+		s.log.Warn("No client mapping found for website %s", websiteAddr.String())
+		return
+	}
+
+	clientAddr, err := net.ResolveUDPAddr("udp", clientAddrStr)
+	if err != nil {
+		s.log.Error("Failed to resolve client address: %v", err)
+		return
+	}
+
+	s.log.Debug("Forwarding %d bytes to client %s", len(data), clientAddrStr)
+
+	conn, err := net.DialUDP("udp", nil, clientAddr)
+	if err != nil {
+		s.log.Error("Failed to create UDP connection to client: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(data)
+	if err != nil {
+		s.log.Error("Failed to forward packet to client: %v", err)
+		return
+	}
+
+	s.log.Debug("Forwarded %d bytes to client %s", len(data), clientAddrStr)
+}
+
+func (s *TransparentProxyServer) updateMapping(clientAddr string, sniIdentifier []byte, websiteAddr string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	identifierStr := fmt.Sprintf("%x", sniIdentifier)
+	s.clientToWebsite[identifierStr] = websiteAddr
+	s.websiteToClient[websiteAddr] = clientAddr
+}
+
+func (s *TransparentProxyServer) getClientAddrByWebsite(websiteAddr string) string {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	return s.websiteToClient[websiteAddr]
 }

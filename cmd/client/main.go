@@ -8,7 +8,6 @@ import (
 	"quic-transproxy/internal/shared/config"
 	"quic-transproxy/internal/shared/logger"
 	"syscall"
-	"time"
 )
 
 func main() {
@@ -22,9 +21,13 @@ func main() {
 
 	log := logger.NewSimpleLogger()
 
-	listener := client.NewListener(cfg.ListenAddress, cfg.ListenPort, log)
-
-	quicClient := client.NewQUICClient(cfg.ProxyServerAddress, cfg.ProxyServerPort, listener, log)
+	proxyClient := client.NewTransparentProxyClient(
+		cfg.ListenAddress,
+		cfg.ListenPort,
+		cfg.ProxyServerAddress,
+		cfg.ProxyServerPort,
+		log,
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -38,37 +41,7 @@ func main() {
 		cancel()
 	}()
 
-	go func() {
-		for {
-			if err := listener.Start(ctx); err != nil {
-				if err == context.Canceled {
-					return
-				}
-
-				log.Error("Listener error: %v, restarting in 5s...", err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(5 * time.Second):
-					// Continue to try to restart the listener
-				}
-			}
-		}
-	}()
-
-	for {
-		if err := quicClient.Start(ctx); err != nil {
-			if err == context.Canceled {
-				break
-			}
-
-			log.Error("QUIC client error: %v, restarting in 5s...", err)
-			select {
-			case <-ctx.Done():
-				break
-			case <-time.After(5 * time.Second):
-				continue
-			}
-		}
+	if err := proxyClient.Start(ctx); err != nil && err != context.Canceled {
+		log.Error("Proxy client error: %v", err)
 	}
 }

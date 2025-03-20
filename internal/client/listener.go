@@ -5,28 +5,67 @@ import (
 	"fmt"
 	"net"
 	"quic-transproxy/internal/shared/logger"
+	"quic-transproxy/internal/shared/packet"
+	"sync"
 )
 
-type Listener struct {
-	listenAddr string
-	listenPort int
-	log        logger.Logger
-	packetCh   chan []byte
-	addrCh     chan net.Addr
+type TransparentProxyClient struct {
+	listenAddr      string
+	listenPort      int
+	proxyServerAddr string
+	proxyServerPort int
+	log             logger.Logger
+	sniGenerator    *SNIIdentifierGenerator
+
+	appConnections map[string]*net.UDPConn
+	serverConn     *net.UDPConn // Connection to the proxy server
+	mutex          sync.RWMutex
 }
 
-func NewListener(addr string, port int, log logger.Logger) *Listener {
-	return &Listener{
-		listenAddr: addr,
-		listenPort: port,
-		log:        log,
-		packetCh:   make(chan []byte, 100),
-		addrCh:     make(chan net.Addr, 100),
+func NewTransparentProxyClient(listenAddr string, listenPort int, proxyAddr string, proxyPort int, log logger.Logger) *TransparentProxyClient {
+	return &TransparentProxyClient{
+		listenAddr:      listenAddr,
+		listenPort:      listenPort,
+		proxyServerAddr: proxyAddr,
+		proxyServerPort: proxyPort,
+		log:             log,
+		sniGenerator:    NewSNIIdentifierGenerator(),
+		appConnections:  make(map[string]*net.UDPConn),
 	}
 }
 
-func (l *Listener) Start(ctx context.Context) error {
-	addr := fmt.Sprintf("%s:%d", l.listenAddr, l.listenPort)
+func (c *TransparentProxyClient) Start(ctx context.Context) error {
+	err := c.connectToProxyServer()
+	if err != nil {
+		return fmt.Errorf("failed to connect to proxy server: %w", err)
+	}
+	defer c.serverConn.Close()
+
+	return c.listenForLocalTraffic(ctx)
+}
+
+func (c *TransparentProxyClient) connectToProxyServer() error {
+	serverAddr := fmt.Sprintf("%s:%d", c.proxyServerAddr, c.proxyServerPort)
+	raddr, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		return err
+	}
+
+	conn, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		return err
+	}
+
+	c.serverConn = conn
+	c.log.Info("Connected to proxy server at %s", serverAddr)
+
+	go c.receiveFromProxyServer()
+
+	return nil
+}
+
+func (c *TransparentProxyClient) listenForLocalTraffic(ctx context.Context) error {
+	addr := fmt.Sprintf("%s:%d", c.listenAddr, c.listenPort)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return err
@@ -38,40 +77,99 @@ func (l *Listener) Start(ctx context.Context) error {
 	}
 	defer conn.Close()
 
-	l.log.Info("Listener started on %s", addr)
+	c.log.Info("Listening for local traffic on %s", addr)
 
 	buffer := make([]byte, 65535)
-
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			n, srcAddr, err := conn.ReadFromUDP(buffer)
+			n, appAddr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
-				l.log.Error("Error reading UDP: %v", err)
+				c.log.Error("Error reading from application: %v", err)
 				continue
 			}
 
-			data := make([]byte, n)
-			copy(data, buffer[:n])
+			appData := make([]byte, n)
+			copy(appData, buffer[:n])
 
-			l.log.Debug("Received %d bytes from %s", n, srcAddr.String())
+			c.log.Debug("Received %d bytes from application %s", n, appAddr.String())
 
-			select {
-			case l.packetCh <- data:
-				l.addrCh <- srcAddr
-			default:
-				l.log.Warn("Channel full, dropping packet")
-			}
+			c.saveAppConnection(appAddr.String(), conn)
+
+			c.forwardToProxyServer(appData, appAddr)
 		}
 	}
 }
 
-func (l *Listener) GetPacketChannel() <-chan []byte {
-	return l.packetCh
+func (c *TransparentProxyClient) forwardToProxyServer(data []byte, appAddr *net.UDPAddr) {
+	sniIdentifier := c.sniGenerator.GenerateFromAddr(appAddr)
+
+	modifiedPacket := packet.NewPacket(data)
+	modifiedPacket.AppendSNIIdentifier(sniIdentifier)
+
+	_, err := c.serverConn.Write(modifiedPacket.Data)
+	if err != nil {
+		c.log.Error("Failed to forward packet to proxy server: %v", err)
+		return
+	}
+
+	c.log.Debug("Forwarded %d bytes to proxy server", len(modifiedPacket.Data))
 }
 
-func (l *Listener) GetAddrChannel() <-chan net.Addr {
-	return l.addrCh
+func (c *TransparentProxyClient) receiveFromProxyServer() {
+	buffer := make([]byte, 65535)
+	for {
+		n, _, err := c.serverConn.ReadFromUDP(buffer)
+		if err != nil {
+			c.log.Error("Error reading from proxy server: %v", err)
+			continue
+		}
+
+		responseData := make([]byte, n)
+		copy(responseData, buffer[:n])
+
+		c.log.Debug("Received %d bytes from proxy server", n)
+
+		// 获取原始请求的源地址（本地应用）
+		// 注意：这里需要一种方式来确定这个响应应该发送给哪个本地应用
+		// 实际实现中，可能需要额外的标识符或基于Connection ID的映射
+
+		// 简化实现，假设最后一个请求的应用是目标
+		c.forwardToApplication(responseData)
+	}
+}
+
+func (c *TransparentProxyClient) forwardToApplication(data []byte) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	// 实际实现应该有更好的映射机制
+	// 这里简化处理，将响应发送到所有已知应用连接
+	for appAddr, conn := range c.appConnections {
+		addr, err := net.ResolveUDPAddr("udp", appAddr)
+		if err != nil {
+			c.log.Error("Failed to resolve application address: %v", err)
+			continue
+		}
+
+		_, err = conn.WriteToUDP(data, addr)
+		if err != nil {
+			c.log.Error("Failed to forward response to application %s: %v", appAddr, err)
+			continue
+		}
+
+		c.log.Debug("Forwarded %d bytes to application %s", len(data), appAddr)
+	}
+}
+
+func (c *TransparentProxyClient) saveAppConnection(appAddr string, conn *net.UDPConn) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if _, exists := c.appConnections[appAddr]; !exists {
+		c.appConnections[appAddr] = conn
+		c.log.Debug("Saved new application connection: %s", appAddr)
+	}
 }

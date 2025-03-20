@@ -22,7 +22,7 @@ func main() {
 
 	log := logger.NewSimpleLogger()
 
-	listener := server.NewQUICListener(cfg.ListenAddress, cfg.ListenPort, log)
+	proxyServer := server.NewTransparentProxyServer(cfg.ListenPort, 443, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -36,7 +36,7 @@ func main() {
 		cancel()
 	}()
 
-	if err := listener.Start(ctx); err != nil && err != context.Canceled {
-		log.Error("QUIC listener error: %v", err)
+	if err := proxyServer.Start(ctx); err != nil && err != context.Canceled {
+		log.Error("Proxy server error: %v", err)
 	}
 }

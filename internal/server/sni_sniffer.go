@@ -7,5 +7,5 @@ func NewSNISniffer() *SNISniffer {
 }
 
 func (s *SNISniffer) Sniff(data []byte) string {
-	return "example.com"
+	return "theunknown.site"
 }
