@@ -141,8 +141,18 @@ func (c *TransparentProxyServer) handleOutboundTraffic(clientConn *net.UDPConn, 
 
 		c.log.Debug("Received %d bytes from target", n)
 
-		// 转发响应回客户端
-		_, err = clientConn.WriteToUDP(buffer[:n], clientAddr)
+		pkt := packet.NewPacket(buffer[:n])
+
+		sniIdentifier, exists := c.websiteToClient.Get(targetConn)
+		if !exists {
+			c.log.Error("No client address found for target connection")
+			return
+		}
+
+		pkt.AppendSNIIdentifier([]byte(sniIdentifier))
+
+		// forward to client
+		_, err = clientConn.WriteToUDP(pkt.Data, clientAddr)
 		if err != nil {
 			c.log.Error("Error writing to client: %v", err)
 			return
