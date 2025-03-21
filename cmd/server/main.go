@@ -22,7 +22,7 @@ func main() {
 
 	log := logger.NewSimpleLogger()
 
-	proxyServer := server.NewTransparentProxyServer(cfg.ListenPort, 443, log)
+	proxyServer := server.NewTransparentProxyServer(cfg.ListenAddress, cfg.ListenPort, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

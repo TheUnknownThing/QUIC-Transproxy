@@ -84,22 +84,22 @@ func (c *TransparentProxyClient) listenForLocalTraffic(ctx context.Context) erro
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			n, appAddr, err := conn.ReadFromUDP(buffer)
+			n, addr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
 				c.log.Error("Error reading from application: %v", err)
 				continue
 			}
 
-			appData := make([]byte, n)
-			copy(appData, buffer[:n])
+			data := make([]byte, n)
+			copy(data, buffer[:n])
 
-			c.log.Debug("Received %d bytes from application %s", n, appAddr.String())
+			c.log.Debug("Received %d bytes from application %s", n, addr.String())
 
-			sniIdentifier := c.sniGenerator.GenerateFromAddr(appAddr)
+			sniIdentifier := c.sniGenerator.GenerateFromAddr(addr)
 
-			c.appConnections.Set(c.sniGenerator.SNIIdentifierToString(sniIdentifier), appAddr)
+			c.appConnections.Set(string(sniIdentifier), addr)
 
-			c.forwardToProxyServer(appData, appAddr)
+			c.forwardToProxyServer(data, addr)
 		}
 	}
 }
@@ -128,10 +128,10 @@ func (c *TransparentProxyClient) receiveFromProxyServer() {
 			continue
 		}
 		pkt := packet.NewPacket(buffer[:n])
-		sniIdentifier := pkt.ExtractSNIIdentifier()
+		sniIdentifier := pkt.ExtractSNIIdentifierStr()
 
 		// Find the original client address
-		appAddr, exists := c.appConnections.Get(c.sniGenerator.SNIIdentifierToString(sniIdentifier))
+		appAddr, exists := c.appConnections.Get(sniIdentifier)
 		if !exists {
 			c.log.Error("Client address not found for SNI identifier %X", sniIdentifier)
 			continue

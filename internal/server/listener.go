@@ -6,56 +6,36 @@ import (
 	"net"
 	"quic-transproxy/internal/shared/logger"
 	"quic-transproxy/internal/shared/packet"
-	"sync"
+	"quic-transproxy/internal/shared/safemap"
 )
 
 type TransparentProxyServer struct {
-	clientPort  int
-	websitePort int
-	log         logger.Logger
-	sniSniffer  *SNISniffer
-	sniMapper   *SNIMapper
+	listenAddr string
+	listenPort int
+	log        logger.Logger
+	sniSniffer *SNISniffer
 
-	clientToWebsite map[string]string // SNI_identifier -> Target_address
-	websiteToClient map[string]string // Address -> Client_address
-	mutex           sync.RWMutex
+	clientToWebsite *safemap.SafeMap[string, *net.UDPConn] // SNI_identifier -> Target_address
+	websiteToClient *safemap.SafeMap[*net.UDPConn, string] // Address -> Client_address
 }
 
-func NewTransparentProxyServer(clientPort, websitePort int, log logger.Logger) *TransparentProxyServer {
+func NewTransparentProxyServer(listenAddr string, listenPort int, log logger.Logger) *TransparentProxyServer {
 	return &TransparentProxyServer{
-		clientPort:      clientPort,
-		websitePort:     websitePort,
+		listenAddr:      listenAddr,
+		listenPort:      listenPort,
 		log:             log,
 		sniSniffer:      NewSNISniffer(),
-		sniMapper:       NewSNIMapper(),
-		clientToWebsite: make(map[string]string),
-		websiteToClient: make(map[string]string),
+		clientToWebsite: safemap.New[string, *net.UDPConn](),
+		websiteToClient: safemap.New[*net.UDPConn, string](),
 	}
 }
 
 func (s *TransparentProxyServer) Start(ctx context.Context) error {
-	errCh := make(chan error, 2)
-
-	go func() {
-		err := s.listenForClients(ctx)
-		errCh <- err
-	}()
-
-	go func() {
-		err := s.listenForWebsites(ctx)
-		errCh <- err
-	}()
-
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return s.listenForInboundTraffic(ctx)
 }
 
-func (s *TransparentProxyServer) listenForClients(ctx context.Context) error {
-	addr := fmt.Sprintf("0.0.0.0:%d", s.clientPort)
+func (c *TransparentProxyServer) listenForInboundTraffic(ctx context.Context) error {
+	addr := fmt.Sprintf("%s:%d", c.listenAddr, c.listenPort)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return err
@@ -67,7 +47,7 @@ func (s *TransparentProxyServer) listenForClients(ctx context.Context) error {
 	}
 	defer conn.Close()
 
-	s.log.Info("Listening for client traffic on %s", addr)
+	c.log.Info("Listening for inbound traffic on %s", addr)
 
 	buffer := make([]byte, 65535)
 	for {
@@ -75,156 +55,97 @@ func (s *TransparentProxyServer) listenForClients(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			n, clientAddr, err := conn.ReadFromUDP(buffer)
+			n, addr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
-				s.log.Error("Error reading from client: %v", err)
+				c.log.Error("Error reading from UDP connection: %v", err)
 				continue
 			}
 
-			clientData := make([]byte, n)
-			copy(clientData, buffer[:n])
+			c.log.Debug("Received %d bytes from %s", n, addr.String())
 
-			s.log.Debug("Received %d bytes from client %s", n, clientAddr.String())
+			pkt := packet.NewPacket(buffer[:n])
+			sniIdentifier := pkt.ExtractSNIIdentifierStr()
+			if sniIdentifier == "" {
+				c.log.Debug("No SNI identifier found in packet")
+				continue
+			}
 
-			go s.handleClientPacket(ctx, clientData, clientAddr)
+			targetConn, exists := c.clientToWebsite.Get(sniIdentifier)
+			if !exists {
+				c.log.Debug("No target address found for SNI identifier %s", sniIdentifier)
+				// sniff
+				targetAddr := c.sniSniffer.Sniff(pkt.Data)
+				if targetAddr == "" {
+					c.log.Debug("No target address found for SNI identifier %s", sniIdentifier)
+					continue
+				}
+
+				targetUDPAddr, err := net.ResolveUDPAddr("udp", targetAddr)
+				if err != nil {
+					c.log.Error("Error resolving target address %s: %v", targetAddr, err)
+					continue
+				}
+
+				targetConn, err := net.DialUDP("udp", nil, targetUDPAddr)
+				if err != nil {
+					c.log.Error("Error dialing target address %s: %v", targetAddr, err)
+					continue
+				}
+
+				c.clientToWebsite.Set(sniIdentifier, targetConn)
+				c.websiteToClient.Set(targetConn, addr.String())
+
+				go c.handleOutboundTraffic(conn, targetConn, addr)
+
+				_, err = targetConn.Write(pkt.Data)
+				if err != nil {
+					c.log.Error("Error writing to target: %v", err)
+					c.clientToWebsite.Delete(sniIdentifier)
+					c.websiteToClient.Delete(targetConn)
+					targetConn.Close()
+					continue
+				}
+			} else {
+				_, err = targetConn.Write(pkt.Data)
+				if err != nil {
+					c.log.Error("Error writing to target: %v", err)
+					c.clientToWebsite.Delete(sniIdentifier)
+					c.websiteToClient.Delete(targetConn)
+					targetConn.Close()
+					continue
+				}
+			}
 		}
 	}
 }
 
-func (s *TransparentProxyServer) listenForWebsites(ctx context.Context) error {
-	addr := fmt.Sprintf("0.0.0.0:%d", s.websitePort)
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return err
-	}
-
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	s.log.Info("Listening for website responses on %s", addr)
+func (c *TransparentProxyServer) handleOutboundTraffic(clientConn *net.UDPConn, targetConn *net.UDPConn, clientAddr *net.UDPAddr) {
+	defer func() {
+		targetConn.Close()
+		c.clientToWebsite.ForEach(func(sni string, conn *net.UDPConn) bool {
+			if conn == targetConn {
+				c.clientToWebsite.Delete(sni)
+			}
+			return true
+		})
+		c.websiteToClient.Delete(targetConn)
+	}()
 
 	buffer := make([]byte, 65535)
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			n, websiteAddr, err := conn.ReadFromUDP(buffer)
-			if err != nil {
-				s.log.Error("Error reading from website: %v", err)
-				continue
-			}
-
-			websiteData := make([]byte, n)
-			copy(websiteData, buffer[:n])
-
-			s.log.Debug("Received %d bytes from website %s", n, websiteAddr.String())
-
-			go s.handleWebsitePacket(ctx, websiteData, websiteAddr)
-		}
-	}
-}
-
-func (s *TransparentProxyServer) handleClientPacket(ctx context.Context, data []byte, clientAddr *net.UDPAddr) {
-	pkt := packet.NewPacket(data)
-	sniIdentifier := pkt.ExtractSNIIdentifier()
-
-	if len(sniIdentifier) != 2 {
-		s.log.Error("Invalid SNI identifier length: %d", len(sniIdentifier))
-		return
-	}
-
-	// if there exists a mapping for this SNI identifier, forward the packet to the website
-	sni := s.sniMapper.Lookup(sniIdentifier)
-	if sni == "" {
-		// sniff SNI from the packet
-		sni := s.sniSniffer.Sniff(pkt.Data)
-
-		if sni == "" {
-			s.log.Warn("Could not sniff SNI from client packet")
+		n, err := targetConn.Read(buffer)
+		if err != nil {
+			c.log.Error("Error reading from target: %v", err)
 			return
 		}
 
-		s.sniMapper.Update(sniIdentifier, sni)
+		c.log.Debug("Received %d bytes from target", n)
+
+		// 转发响应回客户端
+		_, err = clientConn.WriteToUDP(buffer[:n], clientAddr)
+		if err != nil {
+			c.log.Error("Error writing to client: %v", err)
+			return
+		}
 	}
-
-	pkt.RestorePacket()
-
-	targetAddr := fmt.Sprintf("%s:443", sni)
-	raddr, err := net.ResolveUDPAddr("udp", targetAddr)
-
-	s.log.Debug("Creating connection to website %s", targetAddr)
-
-	if err != nil {
-		s.log.Error("Failed to resolve target address: %v", err)
-		return
-	}
-
-	s.updateMapping(clientAddr.String(), sniIdentifier, raddr.String())
-
-	conn, err := net.DialUDP("udp", nil, raddr)
-	if err != nil {
-		s.log.Error("Failed to create UDP connection: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	_, err = conn.Write(pkt.Data)
-	if err != nil {
-		s.log.Error("Failed to forward packet to website: %v", err)
-		return
-	}
-
-	s.log.Debug("Forwarded %d bytes to website %s", len(pkt.Data), targetAddr)
-}
-
-func (s *TransparentProxyServer) handleWebsitePacket(ctx context.Context, data []byte, websiteAddr *net.UDPAddr) {
-	// clientAddrStr := s.getClientAddrByWebsite(websiteAddr.String())
-	clientAddrStr := "127.0.0.1:8000"
-	if clientAddrStr == "" {
-		s.log.Warn("No client mapping found for website %s", websiteAddr.String())
-		return
-	}
-
-	clientAddr, err := net.ResolveUDPAddr("udp", clientAddrStr)
-	if err != nil {
-		s.log.Error("Failed to resolve client address: %v", err)
-		return
-	}
-
-	s.log.Debug("Forwarding %d bytes to client %s", len(data), clientAddrStr)
-
-	conn, err := net.DialUDP("udp", nil, clientAddr)
-	if err != nil {
-		s.log.Error("Failed to create UDP connection to client: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	_, err = conn.Write(data)
-	if err != nil {
-		s.log.Error("Failed to forward packet to client: %v", err)
-		return
-	}
-
-	s.log.Debug("Forwarded %d bytes to client %s", len(data), clientAddrStr)
-}
-
-func (s *TransparentProxyServer) updateMapping(clientAddr string, sniIdentifier []byte, websiteAddr string) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	identifierStr := fmt.Sprintf("%x", sniIdentifier)
-	s.clientToWebsite[identifierStr] = websiteAddr
-	s.websiteToClient[websiteAddr] = clientAddr
-}
-
-func (s *TransparentProxyServer) getClientAddrByWebsite(websiteAddr string) string {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-
-	return s.websiteToClient[websiteAddr]
 }

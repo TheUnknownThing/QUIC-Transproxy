@@ -92,3 +92,9 @@ func (sm *SafeMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
 	}
 	return v.(V), l
 }
+
+func (sm *SafeMap[K, V]) ForEach(f func(key K, value V) bool) {
+	sm.m.Range(func(key, value interface{}) bool {
+		return f(key.(K), value.(V))
+	})
+}

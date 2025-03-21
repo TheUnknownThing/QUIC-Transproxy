@@ -17,16 +17,6 @@ func NewSNIIdentifierGenerator() *SNIIdentifierGenerator {
 	}
 }
 
-func (g *SNIIdentifierGenerator) SNIIdentifierToString(id []byte) string {
-	return fmt.Sprintf("%X", id)
-}
-
-func (g *SNIIdentifierGenerator) SNIIdentifierFromString(s string) []byte {
-	id := make([]byte, 2)
-	fmt.Sscanf(s, "%X", &id)
-	return id
-}
-
 func (g *SNIIdentifierGenerator) Generate(srcIP net.IP, srcPort int) []byte {
 	key := fmt.Sprintf("%s:%d", srcIP.String(), srcPort)
 

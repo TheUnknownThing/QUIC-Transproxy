@@ -7,5 +7,6 @@ func NewSNISniffer() *SNISniffer {
 }
 
 func (s *SNISniffer) Sniff(data []byte) string {
+	// PLACEHOLDER: Implement SNI sniffing logic here
 	return "theunknown.site"
 }

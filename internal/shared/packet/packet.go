@@ -31,3 +31,18 @@ func (p *Packet) RestorePacket() {
 	}
 	p.Data = p.Data[:len(p.Data)-2]
 }
+
+func (p *Packet) ExtractSNIIdentifierStr() string {
+	identifier := p.ExtractSNIIdentifier()
+	if identifier == nil {
+		return ""
+	}
+	return string(identifier)
+}
+
+func (p *Packet) AppendSNIIdentifierStr(identifier string) {
+	if len(identifier) != 2 {
+		return
+	}
+	p.AppendSNIIdentifier([]byte(identifier))
+}
