@@ -8,17 +8,19 @@ import (
 )
 
 type SNIIdentifierGenerator struct {
-	cache map[string][]byte
+	cache      map[string][]byte
+	ClientMark int
 }
 
-func NewSNIIdentifierGenerator() *SNIIdentifierGenerator {
+func NewSNIIdentifierGenerator(ClientMark int) *SNIIdentifierGenerator {
 	return &SNIIdentifierGenerator{
-		cache: make(map[string][]byte),
+		cache:      make(map[string][]byte),
+		ClientMark: ClientMark,
 	}
 }
 
 func (g *SNIIdentifierGenerator) Generate(srcIP net.IP, srcPort int) []byte {
-	key := fmt.Sprintf("%s:%d", srcIP.String(), srcPort)
+	key := fmt.Sprintf("%s:%d:%d", srcIP.String(), srcPort, g.ClientMark)
 
 	if id, exists := g.cache[key]; exists {
 		return id
@@ -28,6 +30,7 @@ func (g *SNIIdentifierGenerator) Generate(srcIP net.IP, srcPort int) []byte {
 	h := fnv.New32a()
 	h.Write(srcIP)
 	binary.Write(h, binary.BigEndian, uint16(srcPort))
+	binary.Write(h, binary.BigEndian, uint32(g.ClientMark)) // Include ClientMark in hash
 
 	hash := h.Sum32()
 	identifier := make([]byte, 2)

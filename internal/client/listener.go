@@ -22,14 +22,14 @@ type TransparentProxyClient struct {
 	serverConn     *net.UDPConn // Connection to the proxy server
 }
 
-func NewTransparentProxyClient(listenAddr string, listenPort int, proxyAddr string, proxyPort int, log logger.Logger) *TransparentProxyClient {
+func NewTransparentProxyClient(listenAddr string, listenPort int, proxyAddr string, proxyPort int, ClientMark int, log logger.Logger) *TransparentProxyClient {
 	return &TransparentProxyClient{
 		listenAddr:      listenAddr,
 		listenPort:      listenPort,
 		proxyServerAddr: proxyAddr,
 		proxyServerPort: proxyPort,
 		log:             log,
-		sniGenerator:    NewSNIIdentifierGenerator(),
+		sniGenerator:    NewSNIIdentifierGenerator(ClientMark),
 		appConnections:  safemap.New[string, *net.UDPAddr](),
 	}
 }

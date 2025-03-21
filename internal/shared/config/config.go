@@ -6,6 +6,7 @@ type ClientConfig struct {
 	ProxyServerAddress string
 	ProxyServerPort    int
 	LogLevel           string
+	ClientMark         int
 }
 
 type ServerConfig struct {
@@ -22,6 +23,7 @@ func LoadClientConfig() (*ClientConfig, error) {
 		ProxyServerAddress: "127.0.0.1",
 		ProxyServerPort:    9000,
 		LogLevel:           "info",
+		ClientMark:         0x1,
 	}, nil
 }
 

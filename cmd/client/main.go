@@ -26,6 +26,7 @@ func main() {
 		cfg.ListenPort,
 		cfg.ProxyServerAddress,
 		cfg.ProxyServerPort,
+		cfg.ClientMark,
 		log,
 	)
 
