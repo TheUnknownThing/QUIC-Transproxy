@@ -22,10 +22,11 @@ func (p *Packet) ExtractSNIIdentifier() []byte {
 	if dataLen < 2 {
 		return nil
 	}
+	defer p.restorePacket()
 	return p.Data[dataLen-2:]
 }
 
-func (p *Packet) RestorePacket() {
+func (p *Packet) restorePacket() {
 	if len(p.Data) < 2 {
 		return
 	}
