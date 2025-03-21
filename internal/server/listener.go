@@ -80,6 +80,8 @@ func (c *TransparentProxyServer) listenForInboundTraffic(ctx context.Context) er
 					continue
 				}
 
+				targetAddr = fmt.Sprintf("%s:%d", targetAddr, 443)
+
 				targetUDPAddr, err := net.ResolveUDPAddr("udp", targetAddr)
 				if err != nil {
 					c.log.Error("Error resolving target address %s: %v", targetAddr, err)
