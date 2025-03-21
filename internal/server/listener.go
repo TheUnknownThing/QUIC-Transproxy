@@ -95,7 +95,7 @@ func (c *TransparentProxyServer) listenForInboundTraffic(ctx context.Context) er
 				}
 
 				c.clientToWebsite.Set(sniIdentifier, targetConn)
-				c.websiteToClient.Set(targetConn, addr.String())
+				c.websiteToClient.Set(targetConn, sniIdentifier)
 
 				go c.handleOutboundTraffic(conn, targetConn, addr)
 
@@ -151,6 +151,7 @@ func (c *TransparentProxyServer) handleOutboundTraffic(clientConn *net.UDPConn, 
 			return
 		}
 
+		c.log.Debug("Forwarding %d bytes to %s", n, sniIdentifier)
 		pkt.AppendSNIIdentifier([]byte(sniIdentifier))
 
 		// forward to client
