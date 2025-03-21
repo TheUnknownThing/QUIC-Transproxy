@@ -12,6 +12,7 @@ import (
 type TransparentProxyClient struct {
 	listenAddr      string
 	listenPort      int
+	listenConn      *net.UDPConn
 	proxyServerAddr string
 	proxyServerPort int
 	log             logger.Logger
@@ -74,6 +75,9 @@ func (c *TransparentProxyClient) listenForLocalTraffic(ctx context.Context) erro
 	if err != nil {
 		return err
 	}
+
+	c.listenConn = conn
+
 	defer conn.Close()
 
 	c.log.Info("Listening for local traffic on %s", addr)
@@ -142,7 +146,7 @@ func (c *TransparentProxyClient) receiveFromProxyServer() {
 }
 
 func (c *TransparentProxyClient) forwardToApplication(data []byte, appAddr *net.UDPAddr) {
-	_, err := c.serverConn.WriteToUDP(data, appAddr)
+	_, err := c.listenConn.WriteToUDP(data, appAddr)
 	if err != nil {
 		c.log.Error("Failed to forward packet to application: %v", err)
 		return
