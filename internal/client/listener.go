@@ -6,7 +6,7 @@ import (
 	"net"
 	"quic-transproxy/internal/shared/logger"
 	"quic-transproxy/internal/shared/packet"
-	"sync"
+	"quic-transproxy/internal/shared/safemap"
 )
 
 type TransparentProxyClient struct {
@@ -17,9 +17,8 @@ type TransparentProxyClient struct {
 	log             logger.Logger
 	sniGenerator    *SNIIdentifierGenerator
 
-	appConnections map[string]*net.UDPConn
+	appConnections *safemap.SafeMap[string, *net.UDPAddr]
 	serverConn     *net.UDPConn // Connection to the proxy server
-	mutex          sync.RWMutex
 }
 
 func NewTransparentProxyClient(listenAddr string, listenPort int, proxyAddr string, proxyPort int, log logger.Logger) *TransparentProxyClient {
@@ -30,7 +29,7 @@ func NewTransparentProxyClient(listenAddr string, listenPort int, proxyAddr stri
 		proxyServerPort: proxyPort,
 		log:             log,
 		sniGenerator:    NewSNIIdentifierGenerator(),
-		appConnections:  make(map[string]*net.UDPConn),
+		appConnections:  safemap.New[string, *net.UDPAddr](),
 	}
 }
 
@@ -96,7 +95,9 @@ func (c *TransparentProxyClient) listenForLocalTraffic(ctx context.Context) erro
 
 			c.log.Debug("Received %d bytes from application %s", n, appAddr.String())
 
-			c.saveAppConnection(appAddr.String(), conn)
+			sniIdentifier := c.sniGenerator.GenerateFromAddr(appAddr)
+
+			c.appConnections.Set(c.sniGenerator.SNIIdentifierToString(sniIdentifier), appAddr)
 
 			c.forwardToProxyServer(appData, appAddr)
 		}
@@ -126,50 +127,26 @@ func (c *TransparentProxyClient) receiveFromProxyServer() {
 			c.log.Error("Error reading from proxy server: %v", err)
 			continue
 		}
+		pkt := packet.NewPacket(buffer[:n])
+		sniIdentifier := pkt.ExtractSNIIdentifier()
 
-		responseData := make([]byte, n)
-		copy(responseData, buffer[:n])
-
-		c.log.Debug("Received %d bytes from proxy server", n)
-
-		// 获取原始请求的源地址（本地应用）
-		// 注意：这里需要一种方式来确定这个响应应该发送给哪个本地应用
-		// 实际实现中，可能需要额外的标识符或基于Connection ID的映射
-
-		// 简化实现，假设最后一个请求的应用是目标
-		c.forwardToApplication(responseData)
-	}
-}
-
-func (c *TransparentProxyClient) forwardToApplication(data []byte) {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-
-	// 实际实现应该有更好的映射机制
-	// 这里简化处理，将响应发送到所有已知应用连接
-	for appAddr, conn := range c.appConnections {
-		addr, err := net.ResolveUDPAddr("udp", appAddr)
-		if err != nil {
-			c.log.Error("Failed to resolve application address: %v", err)
+		// Find the original client address
+		appAddr, exists := c.appConnections.Get(c.sniGenerator.SNIIdentifierToString(sniIdentifier))
+		if !exists {
+			c.log.Error("Client address not found for SNI identifier %X", sniIdentifier)
 			continue
 		}
 
-		_, err = conn.WriteToUDP(data, addr)
-		if err != nil {
-			c.log.Error("Failed to forward response to application %s: %v", appAddr, err)
-			continue
-		}
-
-		c.log.Debug("Forwarded %d bytes to application %s", len(data), appAddr)
+		c.forwardToApplication(pkt.Data, appAddr)
 	}
 }
 
-func (c *TransparentProxyClient) saveAppConnection(appAddr string, conn *net.UDPConn) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	if _, exists := c.appConnections[appAddr]; !exists {
-		c.appConnections[appAddr] = conn
-		c.log.Debug("Saved new application connection: %s", appAddr)
+func (c *TransparentProxyClient) forwardToApplication(data []byte, appAddr *net.UDPAddr) {
+	_, err := c.serverConn.WriteToUDP(data, appAddr)
+	if err != nil {
+		c.log.Error("Failed to forward packet to application: %v", err)
+		return
 	}
+
+	c.log.Debug("Forwarded %d bytes to application %s", len(data), appAddr.String())
 }
